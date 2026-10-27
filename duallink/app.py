@@ -15,7 +15,6 @@ except ImportError:  # still usable as a plain window
 
 LIVE, OFFAIR = "live", "offair"
 LIVE_RED, OFFAIR_GREEN, IDLE_GREY = "#d93025", "#1e8e3e", "#e8eaed"
-LINK_NAMES = {"ethernet": "Ethernet", "tether": "Phone tether"}
 
 
 def fmt_bytes(n):
@@ -97,7 +96,7 @@ class App:
         self.backup_meter = RateMeter()
         self.obs_ip = None
         self.obs_checked = 0.0
-        self.tether_was_up = None
+        self.last_main = None
         self.told_about_tray = False
 
         self.root = tk.Tk()
@@ -135,16 +134,15 @@ class App:
 
         lf = ttk.LabelFrame(self.root, text="Links")
         lf.pack(fill="x", **pad)
-        for col, head in enumerate(("Link", "Adapter", "IP address", "Download", "Upload")):
-            ttk.Label(lf, text=head, font=("Segoe UI", 9, "bold")).grid(
-                row=0, column=col, sticky="w", padx=8)
-        self.link_cells = {}
-        for row, role in enumerate(links.ROLES, start=1):
-            cells = [ttk.Label(lf, text=LINK_NAMES[role] if c == 0 else "-") for c in range(5)]
-            for c, w in enumerate(cells):
-                w.grid(row=row, column=c, sticky="w", padx=8, pady=2)
-            self.link_cells[role] = cells
-        lf.columnconfigure(1, weight=1)
+        cols = ("adapter", "ip", "down", "up", "job")
+        self.link_tree = ttk.Treeview(lf, columns=cols, height=3, selectmode="none")
+        self.link_tree.heading("#0", text="Link")
+        self.link_tree.column("#0", width=120)
+        for c, head, w in zip(cols, ("Adapter", "IP address", "Download", "Upload", "Used for"),
+                              (110, 110, 85, 85, 260)):
+            self.link_tree.heading(c, text=head)
+            self.link_tree.column(c, width=w, anchor="w")
+        self.link_tree.pack(fill="x", padx=4, pady=4)
 
         self.notice = tk.Label(self.root, justify="left", anchor="w", fg="#b3261e",
                                wraplength=780)
@@ -174,13 +172,13 @@ class App:
         ttk.Button(row2, text="Open folder",
                    command=lambda: os.startfile(self.cfg["download_dir"])).pack(side="left")
 
-        cols = ("size", "progress", "speed", "eta", "ethernet", "tether", "status")
+        cols = ("size", "progress", "speed", "eta", "links", "status")
         self.dl_tree = ttk.Treeview(f, columns=cols, height=8)
         self.dl_tree.heading("#0", text="File")
-        self.dl_tree.column("#0", width=200)
-        for c, head, w in zip(cols, ("Size", "Progress", "Speed", "Time left", "Ethernet",
-                                     "Tether", "Status"),
-                              (75, 65, 85, 75, 85, 85, 170)):
+        self.dl_tree.column("#0", width=190)
+        for c, head, w in zip(cols, ("Size", "Progress", "Speed", "Time left", "Per link",
+                                     "Status"),
+                              (70, 60, 80, 70, 210, 170)):
             self.dl_tree.heading(c, text=head)
             self.dl_tree.column(c, width=w, anchor="w")
         self.dl_tree.pack(fill="both", expand=True)
@@ -434,28 +432,63 @@ class App:
         self.root.after(1000, self.tick)
 
     def _refresh_links(self, snap):
-        for role, cells in self.link_cells.items():
-            s = snap[role]
-            up = bool(s["ip"])
-            cells[1].configure(text=s["alias"] or "not found")
-            cells[2].configure(text=s["ip"] or "offline")
-            cells[3].configure(text=self.rate(s["down"]) if up else "-")
-            cells[4].configure(text=self.rate(s["up"]) if up else "-")
+        existing = set(self.link_tree.get_children())
+        wanted = []
+        for l in snap:
+            if not l["ip"]:
+                job = "Offline"
+            elif l["same_router"]:
+                job = "Not used: same router as ethernet"
+            elif l["kind"] == "ethernet":
+                job = "OBS stream (+ downloads when off-air)"
+            elif l["main"]:
+                job = "Games & apps + downloads/backups"
+            else:
+                job = "Downloads & backups"
+            values = (l["alias"], l["ip"] or "-", self.rate(l["down"]) if l["ip"] else "-",
+                      self.rate(l["up"]) if l["ip"] else "-", job)
+            iid = "link:" + l["id"]
+            wanted.append(iid)
+            if iid in existing:
+                self.link_tree.item(iid, text=links.link_name(l["id"]), values=values)
+            else:
+                self.link_tree.insert("", "end", iid=iid, text=links.link_name(l["id"]),
+                                      values=values)
+        for iid in existing - set(wanted):
+            self.link_tree.delete(iid)
+        for pos, iid in enumerate(wanted):
+            self.link_tree.move(iid, "", pos)
+        self.link_tree.configure(height=max(2, len(wanted)))
+
+    def _per_link(self, rates):
+        """'Eth 29 Mbps · Tether 181 Mbps' for links that moved data."""
+        parts = [f"{links.link_name(k, short=True)} {self.rate(v)}"
+                 for k, v in sorted(rates.items(), key=lambda kv: (links.kind_of(kv[0]) != "ethernet", kv[0]))
+                 if v > 0]
+        return " · ".join(parts)
 
     def _refresh_notices(self, snap, error):
         notes = []
-        eth_ip, tether_ip = snap["ethernet"]["ip"], snap["tether"]["ip"]
+        eth = next((l for l in snap if l["kind"] == "ethernet"), None)
+        eth_ip = eth["ip"] if eth else None
+        main = next((l for l in snap if l["main"]), None)
         if not self.control_routes:
             notes.append("Running without admin rights, so DualLink can't make the phone "
                          "tether the main link. Restart it and accept the admin prompt.")
-        if not tether_ip:
-            notes.append("Phone tether isn't connected - everything is using ethernet."
+        if not main:
+            notes.append("No phone tether or Wi-Fi hotspot connected - everything is using ethernet."
                          + (" This will eat into your stream's bandwidth." if self.mode == LIVE else ""))
         if not eth_ip:
             notes.append("Ethernet is offline.")
-        if self.tether_was_up and not tether_ip and self.mode == LIVE:
-            self.notify("Phone tether dropped while live - games are now on ethernet with OBS.")
-        self.tether_was_up = bool(tether_ip)
+        if any(l["same_router"] for l in snap):
+            notes.append("Wi-Fi is connected to the same router as ethernet, so it adds no speed "
+                         "and DualLink leaves it out. Connect Wi-Fi to a phone hotspot to use it.")
+        main_id = main["id"] if main else None
+        if self.last_main and self.last_main != main_id and self.mode == LIVE:
+            self.notify(f"{links.link_name(self.last_main)} dropped while live - "
+                        + (f"games moved to {links.link_name(main_id)}." if main_id
+                           else "games are now on ethernet with OBS."))
+        self.last_main = main_id
 
         now = time.monotonic()
         if now - self.obs_checked > 10:
@@ -480,11 +513,10 @@ class App:
         for d in list(self.downloads.items):
             iid = str(id(d))
             prev = self.dl_prev.get(iid)
-            rates = {}
-            for role in links.ROLES:
-                b = d.link_bytes[role]
-                rates[role] = (b - prev[0][role]) / max(now - prev[1], 1e-3) if prev else 0.0
-            self.dl_prev[iid] = (dict(d.link_bytes), now)
+            counts = dict(d.link_bytes)
+            rates = {k: (b - prev[0].get(k, 0)) / max(now - prev[1], 1e-3) if prev else 0.0
+                     for k, b in counts.items()}
+            self.dl_prev[iid] = (counts, now)
             running = d.status == downloader.RUNNING
             meter = self.dl_meters.setdefault(iid, RateMeter())
             if running:
@@ -505,8 +537,7 @@ class App:
                           else "Downloading (server allows one link only)")
             values = (fmt_bytes(d.size), pct,
                       self.rate(speed) if running else "", eta,
-                      self.rate(rates["ethernet"]) if running else "",
-                      self.rate(rates["tether"]) if running else "", status)
+                      self._per_link(rates) if running else "", status)
             if iid in existing:
                 self.dl_tree.item(iid, text=d.name, values=values)
             else:
@@ -533,8 +564,7 @@ class App:
             self.backup_detail.configure(text=(
                 f"{fmt_bytes(done)} of {fmt_bytes(job.total_bytes)} - "
                 f"{job.files_done} of {job.files_total} files{eta}\n"
-                f"Ethernet {self.rate(job.speed['ethernet'])}   "
-                f"Tether {self.rate(job.speed['tether'])}"))
+                f"{self._per_link(dict(job.speed))}"))
         else:
             self.backup_bar["value"] = 1000 if job.status == "Up to date" else 0
             self.backup_detail.configure(text=job.phase)

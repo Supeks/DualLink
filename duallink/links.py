@@ -1,12 +1,17 @@
-﻿"""Find the two uplinks, make Windows prefer the tether, and measure traffic.
+"""Find the uplinks, make Windows prefer the main one, and measure traffic.
 
-Routing model: the tether gets the lowest interface metric, so everything that
-doesn't pick a link itself (games, browsers, launchers) uses the tether. OBS is
-pinned to ethernet with its own "Bind to IP" setting. DualLink's downloads and
-backups bind each connection to a link's IP, which Windows (strong host model)
-sends out of the adapter that owns that IP.
+Links: ethernet, any number of USB phone tethers, and Wi-Fi (useful when it's
+connected to a phone hotspot rather than the router ethernet uses).
+
+Routing model: the main link (the first phone tether, or Wi-Fi if there's no
+tether) gets the lowest interface metric, so everything that doesn't pick a
+link itself (games, browsers, launchers) uses it. OBS is pinned to ethernet
+with its own "Bind to IP" setting. DualLink's downloads and backups bind each
+connection to a link's IP, which Windows (strong host model) sends out of the
+adapter that owns that IP.
 """
 import configparser
+import ipaddress
 import json
 import os
 import socket
@@ -23,7 +28,20 @@ TETHER_HINTS = ("remote ndis", "rndis", "apple mobile device ethernet")
 NOT_ETHERNET_HINTS = ("bluetooth", "virtual", "hyper-v", "vpn", "tap-", "wintun",
                       "wireguard", "loopback", "vmware", "virtualbox")
 CREATE_NO_WINDOW = 0x08000000
-ROLES = ("ethernet", "tether")
+KIND_NAMES = {"ethernet": "Ethernet", "tether": "Phone tether", "wifi": "Wi-Fi"}
+SHORT_NAMES = {"ethernet": "Eth", "tether": "Tether", "wifi": "Wi-Fi"}
+
+
+def kind_of(link_id):
+    """Link ids are "ethernet", "tether", "tether 2", ..., "wifi"."""
+    return link_id.split()[0]
+
+
+def link_name(link_id, short=False):
+    kind = kind_of(link_id)
+    base = (SHORT_NAMES if short else KIND_NAMES).get(kind, link_id)
+    number = link_id[len(kind):].strip()
+    return f"{base} {number}" if number else base
 
 
 def _ps(command):
@@ -56,25 +74,51 @@ def list_adapters():
 
 
 def detect(adapters, cfg):
-    """Return (ethernet_alias, tether_alias). Either may be None."""
-    tether = cfg.get("tether_alias") or None
-    ethernet = cfg.get("ethernet_alias") or None
+    """Classify adapters into links: [{"id", "kind", "alias"}], ethernet first,
+    then phone tethers (ids "tether", "tether 2", ... by adapter name), then
+    Wi-Fi. Tethers and Wi-Fi are only listed while connected; ethernet is listed
+    even when its cable is out, so the window can say it's offline."""
     # Connected adapters first, so a stale unplugged one doesn't win.
     ordered = sorted(adapters, key=lambda a: a.get("Status") != "Up")
-    if not tether:
-        for a in ordered:
-            desc = (a.get("InterfaceDescription") or "").lower()
-            if any(h in desc for h in TETHER_HINTS):
-                tether = a["Name"]
-                break
+    tethers = sorted(a["Name"] for a in ordered if a.get("Status") == "Up"
+                     and any(h in (a.get("InterfaceDescription") or "").lower() for h in TETHER_HINTS))
+    ethernet = cfg.get("ethernet_alias") or None
     if not ethernet:
         for a in ordered:
             desc = (a.get("InterfaceDescription") or "").lower()
-            if (a["Name"] != tether and a.get("MediaType") == "802.3"
+            if (a.get("MediaType") == "802.3"
                     and not any(h in desc for h in TETHER_HINTS + NOT_ETHERNET_HINTS)):
                 ethernet = a["Name"]
                 break
-    return ethernet, tether
+    wifi = next((a["Name"] for a in ordered if a.get("Status") == "Up"
+                 and a.get("MediaType") == "Native 802.11"), None)
+    links = []
+    if ethernet:
+        links.append({"id": "ethernet", "kind": "ethernet", "alias": ethernet})
+    for n, alias in enumerate(t for t in tethers if t != ethernet):
+        links.append({"id": "tether" if n == 0 else f"tether {n + 1}", "kind": "tether",
+                      "alias": alias})
+    if wifi:
+        links.append({"id": "wifi", "kind": "wifi", "alias": wifi})
+    return links
+
+
+def pick_main(links, cfg):
+    """The link games and other apps should use: the adapter named in settings
+    (main_alias, or the older tether_alias), else the first connected tether,
+    else Wi-Fi if it reaches a different network than ethernet. None means
+    there's no second link and everything stays on ethernet."""
+    want = cfg.get("main_alias") or cfg.get("tether_alias")
+    usable = [l for l in links if l["kind"] != "ethernet" and l.get("ip")
+              and not l.get("same_router")]
+    for l in usable:
+        if want and l["alias"] == want:
+            return l["id"]
+    for kind in ("tether", "wifi"):
+        for l in usable:
+            if l["kind"] == kind:
+                return l["id"]
+    return None
 
 
 def ipv4_of(alias, addrs=None):
@@ -87,8 +131,17 @@ def ipv4_of(alias, addrs=None):
     return None
 
 
+def network_of(alias, addrs=None):
+    """The IPv4 network the adapter is on, e.g. 192.168.1.0/24, or None."""
+    addrs = addrs if addrs is not None else psutil.net_if_addrs()
+    for a in addrs.get(alias, ()):
+        if a.family == socket.AF_INET and a.netmask and not a.address.startswith("169.254."):
+            return ipaddress.ip_network(f"{a.address}/{a.netmask}", strict=False)
+    return None
+
+
 class RouteControl:
-    """Gives the tether a low metric and restores the original metric afterwards.
+    """Gives the main link a low metric and restores the original metric afterwards.
 
     The original values are written to disk before anything changes, so a crash
     or power cut is undone the next time DualLink starts (or with --restore).
@@ -121,16 +174,30 @@ class RouteControl:
             "@{n='Auto';e={\"$($_.AutomaticMetric)\"}}, InterfaceMetric"
         )
 
-    def ensure(self, tether_alias):
+    def ensure(self, alias):
         metric = int(self.cfg["tether_metric"])
         backup = self._read_backup()
-        current = self._state(tether_alias)
-        if tether_alias not in backup:
-            backup[tether_alias] = current
+        current = self._state(alias)
+        if alias not in backup:
+            backup[alias] = current
             self._write_backup(backup)
         if any(r["Auto"] != "Disabled" or int(r["InterfaceMetric"]) != metric for r in current):
-            _ps(f"Set-NetIPInterface -InterfaceAlias {_quote(tether_alias)} "
+            _ps(f"Set-NetIPInterface -InterfaceAlias {_quote(alias)} "
                 f"-AutomaticMetric Disabled -InterfaceMetric {metric}")
+
+    def release(self, keep_alias):
+        """Restore every adapter except keep_alias. Used when the main link moves
+        (say phone 1 was unplugged), so only one adapter is ever preferred."""
+        backup = self._read_backup()
+        others = {a: rows for a, rows in backup.items() if a != keep_alias}
+        if not others:
+            return
+        self._write_backup(others)
+        self.restore()
+        if keep_alias in backup:
+            merged = self._read_backup()
+            merged[keep_alias] = backup[keep_alias]
+            self._write_backup(merged)
 
     def restore(self):
         """Put back every saved metric. Adapters that are unplugged stay in the
@@ -186,9 +253,23 @@ def _read_ini(path):
     return cp
 
 
+def describe(links, addrs):
+    """Add ip and same_router to each link. Wi-Fi on the same network as
+    ethernet is just the same internet line again, so it's marked and left out
+    of downloads and backups."""
+    eth_net = next((network_of(l["alias"], addrs) for l in links if l["kind"] == "ethernet"), None)
+    out = []
+    for l in links:
+        l = dict(l, ip=ipv4_of(l["alias"], addrs), same_router=False)
+        if l["kind"] == "wifi" and eth_net is not None:
+            l["same_router"] = network_of(l["alias"], addrs) == eth_net
+        out.append(l)
+    return out
+
+
 class LinkMonitor(threading.Thread):
-    """Background thread: keeps link info and speeds fresh, and keeps the tether
-    preferred while routing control is on."""
+    """Background thread: keeps link info and speeds fresh, and keeps the main
+    link preferred while routing control is on."""
 
     DETECT_EVERY = 5.0
     ROUTE_CHECK_EVERY = 30.0
@@ -199,22 +280,25 @@ class LinkMonitor(threading.Thread):
         self.routes = RouteControl(cfg) if control_routes else None
         self._halt = threading.Event()
         self._lock = threading.Lock()
-        self.snapshot = {r: {"alias": None, "ip": None, "down": 0.0, "up": 0.0} for r in ROLES}
+        # Each: id, kind, alias, ip, same_router, main, down, up (bytes/s).
+        self.links = []
         self.error = ""
 
     def ips(self):
+        """{link id: ip or None} for every link downloads and backups may use."""
         with self._lock:
-            return {r: self.snapshot[r]["ip"] for r in ROLES}
+            return {l["id"]: l["ip"] for l in self.links if not l["same_router"]}
 
     def get(self):
         with self._lock:
-            return {r: dict(v) for r, v in self.snapshot.items()}, self.error
+            return [dict(l) for l in self.links], self.error
 
     def stop(self):
         self._halt.set()
 
     def run(self):
-        aliases = (None, None)
+        found = []
+        main_alias = None
         last_detect = last_route = 0.0
         detect_error = route_error = ""
         prev, prev_t = psutil.net_io_counters(pernic=True), time.monotonic()
@@ -223,33 +307,32 @@ class LinkMonitor(threading.Thread):
             if now - last_detect >= self.DETECT_EVERY:
                 last_detect = now
                 try:
-                    new = detect(list_adapters(), self.cfg)
-                    if new != aliases:
-                        last_route = 0.0  # re-check routing right away
-                    aliases = new
+                    found = detect(list_adapters(), self.cfg)
                     detect_error = ""
                 except (RuntimeError, ValueError, subprocess.TimeoutExpired) as e:
                     detect_error = f"Couldn't read network adapters: {e}"
-            addrs = psutil.net_if_addrs()
-            tether_ip = ipv4_of(aliases[1], addrs)
-            if self.routes and tether_ip and now - last_route >= self.ROUTE_CHECK_EVERY:
+            links = describe(found, psutil.net_if_addrs())
+            main = pick_main(links, self.cfg)
+            alias = next((l["alias"] for l in links if l["id"] == main), None)
+            if alias != main_alias:
+                main_alias, last_route = alias, 0.0  # re-check routing right away
+            if self.routes and alias and now - last_route >= self.ROUTE_CHECK_EVERY:
                 last_route = now
                 try:
-                    self.routes.ensure(aliases[1])
+                    self.routes.release(alias)
+                    self.routes.ensure(alias)
                     route_error = ""
                 except (RuntimeError, ValueError, subprocess.TimeoutExpired) as e:
-                    route_error = f"Couldn't make the tether the preferred link: {e}"
+                    route_error = f"Couldn't make {link_name(main)} the preferred link: {e}"
             counters = psutil.net_io_counters(pernic=True)
             dt = max(time.monotonic() - prev_t, 1e-3)
-            snap = {}
-            for role, alias in zip(ROLES, aliases):
-                c, p = counters.get(alias), prev.get(alias)
-                down = (c.bytes_recv - p.bytes_recv) / dt if c and p else 0.0
-                up = (c.bytes_sent - p.bytes_sent) / dt if c and p else 0.0
-                snap[role] = {"alias": alias, "ip": ipv4_of(alias, addrs),
-                              "down": max(down, 0.0), "up": max(up, 0.0)}
+            for l in links:
+                c, p = counters.get(l["alias"]), prev.get(l["alias"])
+                l["down"] = max((c.bytes_recv - p.bytes_recv) / dt, 0.0) if c and p else 0.0
+                l["up"] = max((c.bytes_sent - p.bytes_sent) / dt, 0.0) if c and p else 0.0
+                l["main"] = l["id"] == main
             prev, prev_t = counters, time.monotonic()
             with self._lock:
-                self.snapshot = snap
+                self.links = links
                 self.error = detect_error or route_error
             self._halt.wait(1.0)

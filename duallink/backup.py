@@ -16,7 +16,6 @@ import time
 from collections import deque
 
 CREATE_NO_WINDOW = 0x08000000
-ROLES = ("ethernet", "tether")
 BATCH_BYTES = 512 << 20
 BATCH_FILES = 200
 MTIME_SLACK = 1.0  # seconds
@@ -128,7 +127,7 @@ class BackupJob(threading.Thread):
     def __init__(self, cfg, sources):
         super().__init__(daemon=True, name="Backup")
         self.cfg = cfg
-        self.sources = sources  # callable -> {"ethernet": ip|None, "tether": ip|None}
+        self.sources = sources  # callable -> {link id: ip or None}
         self.rclone = cfg["rclone_path"]
         self.status = "Starting"
         self.phase = ""
@@ -136,8 +135,8 @@ class BackupJob(threading.Thread):
         self.done_bytes = 0
         self.files_total = 0
         self.files_done = 0
-        self.live_bytes = {r: 0 for r in ROLES}
-        self.speed = {r: 0.0 for r in ROLES}
+        self.live_bytes = {}  # link id -> bytes of the batch uploading there now
+        self.speed = {}  # link id -> bytes/s
         self.problems = []
         self._halt = threading.Event()
         self._lock = threading.Lock()
@@ -194,12 +193,21 @@ class BackupJob(threading.Thread):
         self.status, self.phase = "Uploading", ""
         queue = deque(batches)
         state = {"in_flight": 0, "offline_since": None}
-        threads = [threading.Thread(target=self._worker, args=(r, queue, state), daemon=True)
-                   for r in ROLES]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join()
+        if not self.sources():
+            raise BackupError("No network links found.")
+        # One rclone at a time per link; a link plugged in mid-backup joins in.
+        threads = {}
+        while True:
+            if not self._halt.is_set():
+                for link, ip in self.sources().items():
+                    if link not in threads and (ip or not threads):
+                        t = threading.Thread(target=self._worker, args=(link, queue, state),
+                                             daemon=True)
+                        threads[link] = t
+                        t.start()
+            if threads and not any(t.is_alive() for t in threads.values()):
+                break
+            time.sleep(0.5)
         if self._halt.is_set():
             self.status = "Stopped"
         elif self.problems:

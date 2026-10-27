@@ -11,13 +11,15 @@ DEFAULTS = {
     # Leave blank to auto-detect. Otherwise the adapter name shown in
     # Settings > Network > Advanced network settings (e.g. "Ethernet 2").
     "ethernet_alias": "",
-    "tether_alias": "",
+    # Which phone tether / Wi-Fi games and apps use. Blank = first tether found.
+    "main_alias": "",
     # Lower metric = Windows prefers that link for normal traffic.
     "tether_metric": 5,
     "mode": "offair",
     "speed_unit": "Mbps",  # or "MB/s"
     "download_dir": str(Path.home() / "Downloads"),
-    "download_workers": {"ethernet": 3, "tether": 6},
+    # Connections per link type, or per link ("tether 2": 4).
+    "download_workers": {"ethernet": 3, "tether": 6, "wifi": 4},
     "chunk_mb": 4,
     "backup_sources": [],
     "backup_remote": "gdrive:PC Backup",

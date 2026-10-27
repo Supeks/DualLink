@@ -88,6 +88,35 @@ def test_split_download_uses_both_links(server, tmp_path):
     assert not os.path.exists(d.path + dl.META_SUFFIX)
 
 
+def test_three_links_all_take_part(server, tmp_path):
+    three = {"ethernet": "127.0.0.1", "tether": "127.0.0.1", "tether 2": "127.0.0.1"}
+    d = dl.Download(server, str(tmp_path), lambda: three, chunk_size=CHUNK,
+                    workers={"ethernet": 2, "tether": 2})  # "tether 2" uses the tether count
+    d.run()
+    assert d.status == dl.DONE, d.error
+    assert read(d.path) == DATA
+    assert set(d.link_bytes) == set(three) and all(v > 0 for v in d.link_bytes.values())
+
+
+def test_link_plugged_in_mid_download_joins(tmp_path):
+    s, url = make_server(delay=0.05)  # slow enough to still be running when it joins
+    sources = {"ethernet": "127.0.0.1", "tether": "127.0.0.1"}
+    try:
+        d = dl.Download(url, str(tmp_path), lambda: dict(sources), chunk_size=CHUNK,
+                        workers={"ethernet": 1, "tether": 1})
+        t = threading.Thread(target=d.run)
+        t.start()
+        while d.done_bytes < CHUNK:
+            time.sleep(0.02)
+        sources["tether 2"] = "127.0.0.1"  # second phone plugged in
+        t.join(60)
+    finally:
+        s.shutdown()
+    assert d.status == dl.DONE, d.error
+    assert read(d.path) == DATA
+    assert d.link_bytes.get("tether 2", 0) > 0
+
+
 def test_server_without_ranges_uses_one_link(tmp_path):
     s, url = make_server(ranges=False)
     try:
@@ -132,7 +161,7 @@ def test_broken_link_is_benched_and_other_link_finishes(server, tmp_path):
     d.run()
     assert d.status == dl.DONE, d.error
     assert read(d.path) == DATA
-    assert d.link_bytes["ethernet"] == 0
+    assert d.link_bytes.get("ethernet", 0) == 0
 
 
 def test_server_connection_limit_shrinks_connections_instead_of_failing(tmp_path):
@@ -258,7 +287,7 @@ def test_resumes_from_old_progress_format(server, tmp_path):
     d.run()
     assert d.status == dl.DONE, d.error
     assert read(d.path) == DATA
-    assert d.link_bytes["ethernet"] + d.link_bytes["tether"] == len(DATA) - 2 * CHUNK
+    assert sum(d.link_bytes.values()) == len(DATA) - 2 * CHUNK
 
 
 def test_delete_removes_finished_file_and_partials(server, tmp_path):

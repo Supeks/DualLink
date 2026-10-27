@@ -23,7 +23,7 @@ from requests.adapters import HTTPAdapter
 
 QUEUED, RUNNING, PAUSED, DONE, FAILED, CANCELLED, DELETED = (
     "Queued", "Downloading", "Paused", "Done", "Failed", "Cancelled", "Deleted")
-ROLES = ("ethernet", "tether")
+DEFAULT_WORKERS = {"ethernet": 3, "tether": 6, "wifi": 4}
 PART_SUFFIX = ".duallink-part"
 META_SUFFIX = ".duallink.json"
 MAX_FAIL_STREAK = 12  # failures in a row, on any link, before giving up
@@ -117,18 +117,20 @@ class Download:
     def __init__(self, url, dest_dir, sources, chunk_size=4 << 20, workers=None):
         self.url = url
         self.dest_dir = dest_dir
-        self.sources = sources  # callable -> {"ethernet": ip|None, "tether": ip|None}
+        # callable -> {link id: ip or None}, e.g. {"ethernet": ..., "tether": ..., "tether 2": ...}
+        self.sources = sources
         # Smallest range worth a new request; a range is only split in two when
         # both halves would be at least this big.
         self.chunk_size = chunk_size
-        self.workers = workers or {"ethernet": 3, "tether": 6}
+        # Connections per link, by link id ("tether 2") or kind ("tether").
+        self.workers = workers or DEFAULT_WORKERS
         self.path = None
         self.size = None
         self.split = None  # True when the server allows ranges over both links
         self.status = QUEUED
         self.error = ""
         self.done_bytes = 0
-        self.link_bytes = {r: 0 for r in ROLES}  # cumulative, for speed display
+        self.link_bytes = {}  # link id -> bytes so far, for speed display
         self._stop_reason = None  # "pause" | "hold" | "cancel"
         self._lock = threading.Lock()
 
@@ -142,23 +144,29 @@ class Download:
     def _stopping(self):
         return self._stop_reason is not None
 
-    def _count(self, role, n):
+    def _count(self, link, n):
         with self._lock:
             self.done_bytes += n
-            self.link_bytes[role] += n
+            self.link_bytes[link] = self.link_bytes.get(link, 0) + n
+
+    def _workers_for(self, link):
+        w = self.workers
+        n = w.get(link, w.get(link.split()[0], DEFAULT_WORKERS.get(link.split()[0], 4)))
+        return max(1, int(n))
 
     def _pick_ip(self):
+        """A connected link for the first request, ethernet last (it's the slowest)."""
         ips = self.sources()
-        for role in ("tether", "ethernet"):
-            if ips.get(role):
-                return role, ips[role]
+        for link in sorted(ips, key=lambda k: k == "ethernet"):
+            if ips[link]:
+                return link, ips[link]
         return None, None
 
     def run(self):
         """Blocking. Leaves status as DONE, FAILED, PAUSED, QUEUED (held) or CANCELLED."""
         self.status, self.error = RUNNING, ""
         try:
-            role, ip = self._pick_ip()
+            link, ip = self._pick_ip()
             if not ip:
                 raise IOError("Neither link has an internet address right now.")
             final_url, ranged = self._probe(ip)
@@ -167,7 +175,7 @@ class Download:
                 self._run_split(final_url)
             else:
                 self.split = False
-                self._run_single(final_url, role, ip)
+                self._run_single(final_url, link, ip)
         except _Stopped:
             pass
         except (requests.RequestException, IOError, OSError) as e:
@@ -203,7 +211,7 @@ class Download:
                 self.size = total
                 return r.url, ranged
 
-    def _run_single(self, url, role, ip):
+    def _run_single(self, url, link, ip):
         """Server can't send ranges: one connection over the faster link, no resume."""
         part = self.path + PART_SUFFIX
         self.done_bytes = 0
@@ -217,7 +225,7 @@ class Download:
                         self.done_bytes = 0
                         raise _Stopped()
                     f.write(block)
-                    self._count(role, len(block))
+                    self._count(link, len(block))
         if self.size is not None and self.done_bytes != self.size:
             raise IOError(f"Connection ended early ({self.done_bytes} of {self.size} bytes).")
         os.replace(part, self.path)
@@ -244,9 +252,10 @@ class Download:
         lock = threading.Lock()
         state = {"fatal": None, "saved": time.monotonic(), "stuck_since": None,
                  "busy_streak": 0, "fail_streak": 0}
-        strikes = {r: 0 for r in ROLES}
+        link_ids = []  # grows if a link is plugged in mid-download
+        strikes = {}
         benched = set()
-        active = {r: max(1, int(self.workers.get(r, 1))) for r in ROLES}
+        active = {}
         fh = open(part, "r+b")
 
         def left():
@@ -254,9 +263,9 @@ class Download:
 
         self.done_bytes = size - left()
 
-        def usable(role):
+        def usable(link):
             # Caller holds lock.
-            return role not in benched and active[role] > 0 and bool(self.sources().get(role))
+            return link not in benched and active[link] > 0 and bool(self.sources().get(link))
 
         def save_meta(force=False):
             # Caller holds lock.
@@ -286,21 +295,21 @@ class Download:
             ranges.append(mine)
             return mine
 
-        def worker(role):
+        def worker(link):
             me = object()
             session, session_ip = None, None
             retired = False  # True once this worker has taken itself out of `active`
             try:
                 while not self._stopping() and not state["fatal"]:
                     with lock:
-                        if role in benched or not left():
+                        if link in benched or not left():
                             return
-                        ip = self.sources().get(role)
+                        ip = self.sources().get(link)
                         rng = claim(me) if ip else None
                         if rng is None:
                             # Nothing can make progress (links offline or set aside):
                             # give up after a minute rather than wait forever.
-                            if any(usable(r) for r in ROLES):
+                            if any(usable(r) for r in link_ids):
                                 state["stuck_since"] = None
                             elif state["stuck_since"] is None:
                                 state["stuck_since"] = time.monotonic()
@@ -315,7 +324,7 @@ class Download:
                         session, session_ip = bound_session(ip), ip
                     before = rng.pos
                     try:
-                        self._stream(session, url, rng, fh, lock, role)
+                        self._stream(session, url, rng, fh, lock, link)
                     except _Stopped:
                         with lock:
                             rng.owner = None
@@ -330,7 +339,7 @@ class Download:
                             if state["busy_streak"] > 40:
                                 state["fatal"] = "The server kept refusing connections (too many requests)."
                             elif sum(active.values()) > 1:
-                                active[role] -= 1
+                                active[link] -= 1
                                 retired = True
                                 return
                         time.sleep(min(2 ** min(state["busy_streak"], 4), 10))
@@ -340,36 +349,52 @@ class Download:
                             rng.owner = None  # bytes already written are kept
                             if rng.pos > before:
                                 state["fail_streak"] = 0
-                                strikes[role] = 0
+                                strikes[link] = 0
                             state["fail_streak"] += 1
-                            strikes[role] += 1
+                            strikes[link] += 1
                             if state["fail_streak"] >= MAX_FAIL_STREAK:
                                 state["fatal"] = f"Kept failing: {e}"
-                            elif (strikes[role] >= MAX_LINK_STRIKES
-                                  and any(usable(r) for r in ROLES if r != role)):
+                            elif (strikes[link] >= MAX_LINK_STRIKES
+                                  and any(usable(r) for r in link_ids if r != link)):
                                 # Only set a link aside while the other one can take over.
-                                benched.add(role)
+                                benched.add(link)
                             save_meta()
-                        time.sleep(min(2 ** strikes[role], 10))
+                        time.sleep(min(2 ** strikes[link], 10))
                         continue
                     with lock:
                         rng.owner = None
-                        state["busy_streak"] = state["fail_streak"] = strikes[role] = 0
+                        state["busy_streak"] = state["fail_streak"] = strikes[link] = 0
                         save_meta()
             finally:
                 if not retired:
                     with lock:
-                        active[role] -= 1
+                        active[link] -= 1
                 if session:
                     session.close()
 
-        threads = [threading.Thread(target=worker, args=(role,), daemon=True)
-                   for role in ROLES for _ in range(active[role])]
-        try:
-            for t in threads:
+        threads = []
+
+        def add_link(link):
+            with lock:
+                link_ids.append(link)
+                strikes[link] = 0
+                active[link] = self._workers_for(link)
+                new = [threading.Thread(target=worker, args=(link,), daemon=True)
+                       for _ in range(active[link])]
+            threads.extend(new)
+            for t in new:
                 t.start()
-            for t in threads:
-                t.join()
+
+        try:
+            for link in self.sources():
+                add_link(link)
+            while any(t.is_alive() for t in threads):
+                time.sleep(0.5)
+                if self._stopping() or state["fatal"]:
+                    continue
+                for link, ip in self.sources().items():
+                    if ip and link not in link_ids and left():
+                        add_link(link)  # e.g. a second phone just plugged in
             with lock:
                 save_meta(force=True)
         finally:
@@ -383,7 +408,7 @@ class Download:
         os.replace(part, self.path)
         os.remove(meta_path)
 
-    def _stream(self, session, url, rng, fh, lock, role):
+    def _stream(self, session, url, rng, fh, lock, link):
         """Stream rng until it's complete. Another connection may shorten rng.end
         meanwhile, so it's re-read under the lock for every block."""
         with lock:
@@ -409,7 +434,7 @@ class Download:
                         rng.pos += n
                     finished = rng.pos >= rng.end
                 if n > 0:
-                    self._count(role, n)
+                    self._count(link, n)
                 if finished:
                     return  # closing the response drops the rest of this request
         with lock:
