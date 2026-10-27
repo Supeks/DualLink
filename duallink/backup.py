@@ -221,8 +221,8 @@ class BackupJob(threading.Thread):
             raise BackupError(_last_line(proc.stderr) or "rclone listremotes failed")
         name = self.cfg["backup_remote"].split(":", 1)[0] + ":"
         if name not in proc.stdout.split():
-            raise BackupError(f"rclone has no remote called {name} - run 'rclone config' "
-                              "to connect Google Drive (see README).")
+            raise BackupError(f"Google Drive isn't connected (no rclone remote called {name}). "
+                              "Click Set up Google Drive at the top of the Backup tab.")
 
     def _worker(self, role, queue, state):
         while not self._halt.is_set():

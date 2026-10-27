@@ -1,11 +1,12 @@
 """DualLink window and tray icon."""
 import os
 import queue
+import threading
 import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
-from . import backup, config, downloader, links
+from . import backup, config, downloader, links, rclone_setup
 
 try:
     import pystray
@@ -98,6 +99,7 @@ class App:
         self.obs_checked = 0.0
         self.last_main = None
         self.told_about_tray = False
+        self.drive_state, self.drive_text = "busy", "Checking..."
 
         self.root = tk.Tk()
         self.root.title("DualLink")
@@ -105,6 +107,7 @@ class App:
         self.root.minsize(640, 480)
         self.root.protocol("WM_DELETE_WINDOW", self.hide)
         self._build()
+        self.check_drive()
         self.tray = self._make_tray()
         self.set_mode(cfg.get("mode", OFFAIR))
         self.root.after(500, self.tick)
@@ -194,6 +197,14 @@ class App:
 
     def _build_backup(self, parent):
         f = ttk.Frame(parent, padding=8)
+        drive_row = ttk.Frame(f)
+        drive_row.pack(fill="x", pady=(0, 8))
+        ttk.Label(drive_row, text="Google Drive:", font=("Segoe UI", 9, "bold")).pack(side="left")
+        self.drive_label = ttk.Label(drive_row, text="Checking...")
+        self.drive_label.pack(side="left", padx=6)
+        self.drive_btn = ttk.Button(drive_row, text="Set up Google Drive", command=self.setup_drive)
+        self.drive_btn.pack(side="right")
+
         ttk.Label(f, text="Folders to back up:").pack(anchor="w")
         row = ttk.Frame(f)
         row.pack(fill="x")
@@ -208,8 +219,8 @@ class App:
 
         row2 = ttk.Frame(f)
         row2.pack(fill="x", pady=8)
-        ttk.Label(row2, text="Google Drive destination (rclone):").pack(side="left")
-        self.remote_var = tk.StringVar(value=self.cfg["backup_remote"])
+        ttk.Label(row2, text="Folder on Google Drive:").pack(side="left")
+        self.remote_var = tk.StringVar(value=self.cfg["backup_remote"].split(":", 1)[1])
         ttk.Entry(row2, textvariable=self.remote_var, width=30).pack(side="left", padx=6)
         ttk.Button(row2, text="Save", command=self.save_remote).pack(side="left")
 
@@ -349,13 +360,73 @@ class App:
         config.save(self.cfg)
 
     def save_remote(self):
-        value = self.remote_var.get().strip()
-        if ":" not in value:
-            messagebox.showwarning("DualLink", "Use the rclone form remote:folder, "
-                                               "for example gdrive:PC Backup")
-            return
-        self.cfg["backup_remote"] = value
+        folder = self.remote_var.get().strip().strip("/\\") or "PC Backup"
+        self.remote_var.set(folder)
+        self.cfg["backup_remote"] = f"{rclone_setup.remote_name(self.cfg['backup_remote'])}:{folder}"
         config.save(self.cfg)
+
+    # Google Drive setup state: missing (no rclone) / disconnected / connected /
+    # error / busy (checking, installing or signing in).
+
+    def check_drive(self):
+        self.drive_state, self.drive_text = "busy", "Checking..."
+        threading.Thread(target=self._check_drive, daemon=True).start()
+
+    def _check_drive(self):
+        rclone = rclone_setup.find_rclone(self.cfg)
+        name = rclone_setup.remote_name(self.cfg["backup_remote"])
+        if not rclone:
+            self.drive_state, self.drive_text = "missing", "Not set up yet"
+            return
+        try:
+            if name not in rclone_setup.remotes(rclone):
+                self.drive_state, self.drive_text = "disconnected", "Not connected"
+                return
+            info = rclone_setup.about(rclone, name)
+        except rclone_setup.SetupError as e:
+            self.drive_state, self.drive_text = "error", f"Problem: {e}"
+            return
+        space = ""
+        if info.get("free") is not None and info.get("total"):
+            space = f" - {fmt_bytes(info['free'])} free of {fmt_bytes(info['total'])}"
+        self.drive_state, self.drive_text = "connected", "Connected" + space
+
+    def setup_drive(self):
+        if self.drive_state == "busy":
+            return
+        if self.drive_state == "connected" and not messagebox.askyesno(
+                "Google Drive", "Google Drive is already connected. Sign in again "
+                                "(for example with a different Google account)?"):
+            return
+        self.drive_state = "busy"
+        threading.Thread(target=self._setup_drive, daemon=True).start()
+
+    def _setup_drive(self):
+        try:
+            rclone = rclone_setup.find_rclone(self.cfg)
+            if not rclone:
+                def progress(done, total):
+                    pct = f" {100 * done / total:.0f}%" if total else ""
+                    self.drive_text = f"Downloading rclone (the Google Drive uploader){pct}..."
+                rclone = rclone_setup.install(progress)
+                self.cfg["rclone_path"] = rclone
+                config.save(self.cfg)
+            self.drive_text = ("Sign in to Google in the browser window that just opened, "
+                               "then click Allow...")
+            rclone_setup.connect_drive(rclone, rclone_setup.remote_name(self.cfg["backup_remote"]))
+        except rclone_setup.SetupError as e:
+            self.drive_state, self.drive_text = "error", f"Setup didn't finish: {e}"
+            return
+        self._check_drive()
+
+    def _refresh_drive(self):
+        self.drive_label.configure(text=self.drive_text)
+        label = {"missing": "Set up Google Drive", "disconnected": "Connect Google Drive",
+                 "connected": "Reconnect", "error": "Try again"}.get(self.drive_state)
+        if label:
+            self.drive_btn.configure(text=label, state="normal")
+        else:
+            self.drive_btn.configure(state="disabled")
 
     def start_backup(self):
         if self.mode == LIVE:
@@ -366,7 +437,12 @@ class App:
         if not self.cfg["backup_sources"]:
             messagebox.showinfo("DualLink", "Add at least one folder to back up first.")
             return
+        if self.drive_state != "connected":
+            messagebox.showinfo("DualLink", "Set up Google Drive first, with the button at the "
+                                            "top of this tab.")
+            return
         self.save_remote()
+        self.cfg["rclone_path"] = rclone_setup.find_rclone(self.cfg) or self.cfg["rclone_path"]
         self.backup_job = backup.BackupJob(self.cfg, self.monitor.ips)
         self.backup_meter = RateMeter()
         self.backup_job.start()
@@ -429,6 +505,7 @@ class App:
         self._refresh_notices(snap, error)
         self._refresh_downloads()
         self._refresh_backup()
+        self._refresh_drive()
         self.root.after(1000, self.tick)
 
     def _refresh_links(self, snap):

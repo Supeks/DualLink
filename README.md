@@ -35,21 +35,11 @@ connection shows which ports share one). A Wi-Fi hotspot avoids USB entirely.
    python -m pip install -r requirements.txt
    ```
 
-2. **rclone** (it does the Google Drive uploading)
-
-   ```bash
-   winget install Rclone.Rclone
-   ```
-
-   Then open a new terminal and connect your Google Drive:
-
-   ```bash
-   rclone config
-   ```
-
-   Choose `n` (new remote), name it `gdrive`, pick **Google Drive** from the
-   list, press Enter through the client ID/secret questions, choose scope `1`
-   (full access), and say yes to opening the browser so you can log in.
+2. **Google Drive** — in DualLink's **Google Drive backup** tab, click **Set up
+   Google Drive**. DualLink downloads rclone (the uploader it uses, about
+   32 MB, from rclone.org, checked against rclone's published checksum), then
+   your browser opens: sign in to Google and click **Allow**. The tab then
+   shows "Connected" and how much space is free.
 
 3. **OBS** — Settings > Advanced > Network > **Bind to IP**: pick your ethernet
    address. DualLink warns you if this stops matching, for example if your
@@ -84,6 +74,23 @@ connections", DualLink drops a connection and carries on with fewer.
 Games and other apps use the main phone link because DualLink gives it the
 lowest Windows interface metric. OBS stays on ethernet through its own Bind to
 IP setting.
+
+## How Google Drive backup works
+
+1. **Compare:** for each folder you added, DualLink lists the files on your
+   PC and the files already in `PC Backup/<folder name>` on Drive, and picks
+   the ones that are new or changed (different size or modified time).
+2. **Batch:** those files are grouped into batches (up to 512 MB or 200 files),
+   biggest first.
+3. **Upload over every link:** each link runs its own rclone upload, tied to
+   that link's address, and takes the next batch when it finishes one, so
+   faster links upload more.
+4. **Next time:** only new or changed files go up. Nothing on Drive is ever
+   deleted, even if you delete it on your PC.
+
+Signing in gives rclone a Google token stored in `%APPDATA%\rclone\rclone.conf`;
+DualLink never sees your password. **Reconnect** signs in again, for example to
+switch Google accounts.
 
 ## Good to know
 
