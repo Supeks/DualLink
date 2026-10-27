@@ -10,6 +10,7 @@ of the time.
 Progress (the ranges still missing) is saved next to the file, so a paused or
 interrupted download resumes where it stopped.
 """
+import html
 import json
 import os
 import re
@@ -74,12 +75,35 @@ def unique_path(path):
     return path
 
 
+def _web_page_error(r):
+    """A message if the server answered with a web page (a quota, sign-in or
+    error page) instead of the file, else None. A page sent as an attachment is
+    a real download and passes."""
+    ctype = r.headers.get("Content-Type", "").lower()
+    if "text/html" not in ctype or "attachment" in r.headers.get("Content-Disposition", "").lower():
+        return None
+    try:
+        text = r.raw.read(65536, decode_content=True).decode("utf-8", "replace")
+    except Exception:
+        text = ""
+    m = re.search(r"<title[^>]*>(.*?)</title>", text, re.I | re.S)
+    title = " ".join(html.unescape(m.group(1)).split()) if m else ""
+    return ("The server sent a web page instead of the file"
+            + (f' ("{title}")' if title else "")
+            + ". It may be a download limit, sign-in or error page.")
+
+
 class _Stopped(Exception):
     pass
 
 
 class _Busy(Exception):
     """Server said too many connections (HTTP 429/503)."""
+
+
+class _WebPage(IOError):
+    """Server sent a web page (quota, sign-in, error) instead of file data.
+    Unlike a dropped connection, retrying the same link won't help soon."""
 
 
 class _Range:
@@ -154,22 +178,26 @@ class Download:
         n = w.get(link, w.get(link.split()[0], DEFAULT_WORKERS.get(link.split()[0], 4)))
         return max(1, int(n))
 
-    def _pick_ip(self):
-        """A connected link for the first request, ethernet last (it's the slowest)."""
+    def _probe_any(self):
+        """Ask about the file over each connected link in turn, ethernet last (it's
+        the slowest), until one gets a real answer. A server may block one link's
+        address (Google Drive's "Quota exceeded") while the others still work."""
         ips = self.sources()
+        error = None
         for link in sorted(ips, key=lambda k: k == "ethernet"):
-            if ips[link]:
-                return link, ips[link]
-        return None, None
+            if not ips[link]:
+                continue
+            try:
+                return (link, ips[link]) + self._probe(ips[link])
+            except (requests.RequestException, IOError, OSError) as e:
+                error = e
+        raise error or IOError("No link has an internet address right now.")
 
     def run(self):
         """Blocking. Leaves status as DONE, FAILED, PAUSED, QUEUED (held) or CANCELLED."""
         self.status, self.error = RUNNING, ""
         try:
-            link, ip = self._pick_ip()
-            if not ip:
-                raise IOError("Neither link has an internet address right now.")
-            final_url, ranged = self._probe(ip)
+            link, ip, final_url, ranged = self._probe_any()
             if ranged and self.size >= 2 * self.chunk_size:
                 self.split = True
                 self._run_split(final_url)
@@ -197,6 +225,9 @@ class Download:
             r = s.get(self.url, headers={"Range": "bytes=0-0"}, stream=True,
                       timeout=(10, 30), allow_redirects=True)
             with r:
+                page = _web_page_error(r)
+                if page:
+                    raise IOError(page)
                 r.raise_for_status()
                 total = None
                 ranged = False
@@ -216,6 +247,9 @@ class Download:
         part = self.path + PART_SUFFIX
         self.done_bytes = 0
         with bound_session(ip) as s, s.get(url, stream=True, timeout=(10, 30)) as r:
+            page = _web_page_error(r)
+            if page:
+                raise IOError(page)
             r.raise_for_status()
             with open(part, "wb") as f:
                 for block in r.iter_content(256 * 1024):
@@ -344,6 +378,16 @@ class Download:
                                 return
                         time.sleep(min(2 ** min(state["busy_streak"], 4), 10))
                         continue
+                    except _WebPage as e:
+                        # This link's address is blocked (e.g. a quota page): take
+                        # it out of this download now; stop if no link is left.
+                        with lock:
+                            rng.owner = None
+                            benched.add(link)
+                            if not any(usable(r) for r in link_ids):
+                                state["fatal"] = str(e)
+                            save_meta()
+                        continue
                     except (requests.RequestException, IOError, OSError) as e:
                         with lock:
                             rng.owner = None  # bytes already written are kept
@@ -420,6 +464,11 @@ class Download:
             if r.status_code in (429, 503):
                 raise _Busy()
             if r.status_code != 206:
+                # e.g. Google Drive's "Quota exceeded" page for this link's address;
+                # the link is set aside and the other links carry on.
+                page = _web_page_error(r)
+                if page:
+                    raise _WebPage(page)
                 raise IOError(f"Server answered {r.status_code} to a range request.")
             if not r.headers.get("Content-Range", "").startswith(f"bytes {start}-"):
                 raise IOError("Server sent the wrong part of the file.")

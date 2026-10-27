@@ -117,6 +117,126 @@ def test_link_plugged_in_mid_download_joins(tmp_path):
     assert d.link_bytes.get("tether 2", 0) > 0
 
 
+QUOTA_PAGE = (b"<!DOCTYPE html><html><head><title>Google Drive - Quota exceeded</title>"
+              b"</head><body>Too many users have downloaded this file recently.</body></html>")
+
+
+def make_quota_server(blocked=lambda client_ip, n: True, max_per_response=None):
+    """Serves DATA, except requests where blocked(client ip, request number) is true
+    get a 200 HTML quota page, like Google Drive does. max_per_response cuts each
+    response short, forcing the client to make new requests."""
+    count = {"n": 0}
+    lock = threading.Lock()
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_GET(self):
+            with lock:
+                count["n"] += 1
+                n = count["n"]
+            if blocked(self.client_address[0], n):
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(QUOTA_PAGE)))
+                self.end_headers()
+                self.wfile.write(QUOTA_PAGE)
+                return
+            m = re.match(r"bytes=(\d+)-(\d+)", self.headers.get("Range", ""))
+            start, end = (int(m.group(1)), min(int(m.group(2)), len(DATA) - 1)) if m else (0, len(DATA) - 1)
+            self.send_response(206 if m else 200)
+            if m:
+                self.send_header("Content-Range", f"bytes {start}-{end}/{len(DATA)}")
+            self.send_header("Content-Type", "video/mp4")
+            self.send_header("Content-Length", str(end - start + 1))
+            self.send_header("Content-Disposition", 'attachment; filename="video.mp4"')
+            self.end_headers()
+            stop = end + 1 if max_per_response is None else min(end + 1, start + max_per_response)
+            try:
+                for i in range(start, stop, 64 * 1024):
+                    time.sleep(0.003)
+                    self.wfile.write(DATA[i:min(i + 64 * 1024, stop)])
+            except (ConnectionError, OSError):
+                return
+            self.close_connection = True
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server, f"http://127.0.0.1:{server.server_port}/download?id=abc"
+
+
+def test_quota_page_is_not_saved_as_the_file(tmp_path):
+    s, url = make_quota_server()
+    try:
+        d = dl.Download(url, str(tmp_path), lambda: BOTH, chunk_size=CHUNK)
+        d.run()
+    finally:
+        s.shutdown()
+    assert d.status == dl.FAILED
+    assert "web page instead of the file" in d.error
+    assert "Google Drive - Quota exceeded" in d.error
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_link_that_gets_quota_page_is_set_aside(tmp_path):
+    # Google blocked one link's address; the other link finishes the download.
+    s, url = make_quota_server(blocked=lambda ip, n: ip == "127.0.0.2")
+    try:
+        sources = lambda: {"ethernet": "127.0.0.1", "tether": "127.0.0.2"}
+        d = dl.Download(url, str(tmp_path), sources, chunk_size=CHUNK,
+                        workers={"ethernet": 2, "tether": 2})
+        d.run()
+    finally:
+        s.shutdown()
+    assert d.status == dl.DONE, d.error
+    assert read(d.path) == DATA
+    assert d.link_bytes.get("tether", 0) == 0
+
+
+def test_quota_mid_download_fails_with_reason_and_keeps_progress(tmp_path):
+    # Every link blocked after 4 requests; short responses force new requests.
+    s, url = make_quota_server(blocked=lambda ip, n: n > 4, max_per_response=1 << 20)
+    try:
+        d = dl.Download(url, str(tmp_path), lambda: BOTH, chunk_size=CHUNK,
+                        workers={"ethernet": 1, "tether": 1})
+        t = threading.Thread(target=d.run, daemon=True)
+        t.start()
+        t.join(180)
+    finally:
+        s.shutdown()
+    assert not t.is_alive(), "download hung"
+    assert d.status == dl.FAILED
+    assert "Quota exceeded" in d.error
+    assert os.path.exists(d.path + dl.META_SUFFIX)  # resumes later from where it stopped
+
+
+def test_html_file_offered_as_attachment_still_downloads(tmp_path):
+    page = b"<html><head><title>My saved page</title></head></html>"
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.send_header("Content-Disposition", 'attachment; filename="page.html"')
+            self.send_header("Content-Length", str(len(page)))
+            self.end_headers()
+            self.wfile.write(page)
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        d = dl.Download(f"http://127.0.0.1:{server.server_port}/p", str(tmp_path), lambda: BOTH)
+        d.run()
+    finally:
+        server.shutdown()
+    assert d.status == dl.DONE, d.error
+    assert read(d.path) == page
+
+
 def test_server_without_ranges_uses_one_link(tmp_path):
     s, url = make_server(ranges=False)
     try:
